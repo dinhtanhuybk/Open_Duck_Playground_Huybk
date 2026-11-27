@@ -34,10 +34,23 @@ MIN_REMAINING = 3_000_000  # below this Brax may not complete one update per eva
 SETTLE_S = int(os.environ.get("ONNX_SETTLE_S", "20"))  # wait until the .onnx file stops changing
 
 api = HfApi()
-work = Path("cloud_work")
+work = Path("cloud_work").resolve()  # absolute: orbax rejects relative checkpoint paths
 work.mkdir(exist_ok=True)
 MANIFEST_REMOTE = f"{RUN_TAG}/manifest.json"
 MANIFEST_LOCAL = work / "manifest.json"
+
+
+def retry(fn, *args, tries=4, **kwargs):
+    """Call fn with exponential backoff; raise the last error if all tries fail."""
+    for i in range(tries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # network or Hub hiccup
+            if i == tries - 1:
+                raise
+            wait = 5 * (2 ** i)
+            print(f"[retry] {type(e).__name__}: {str(e)[:120]} -> retry in {wait}s", flush=True)
+            time.sleep(wait)
 
 
 def load_manifest():
@@ -52,7 +65,7 @@ def load_manifest():
 
 def push_manifest(m):
     MANIFEST_LOCAL.write_text(json.dumps(m, indent=2))
-    api.upload_file(path_or_fileobj=str(MANIFEST_LOCAL), path_in_repo=MANIFEST_REMOTE, repo_id=HF_REPO)
+    retry(api.upload_file, path_or_fileobj=str(MANIFEST_LOCAL), path_in_repo=MANIFEST_REMOTE, repo_id=HF_REPO)
 
 
 class Uploader(threading.Thread):
@@ -68,9 +81,12 @@ class Uploader(threading.Thread):
             size = ev.stat().st_size
             if self.event_sizes.get(ev.name) == size:
                 continue
-            api.upload_file(path_or_fileobj=str(ev),
-                            path_in_repo=f"{RUN_TAG}/tb/seg{self.seg:03d}/{ev.name}", repo_id=HF_REPO)
-            self.event_sizes[ev.name] = size
+            try:
+                retry(api.upload_file, path_or_fileobj=str(ev),
+                      path_in_repo=f"{RUN_TAG}/tb/seg{self.seg:03d}/{ev.name}", repo_id=HF_REPO)
+                self.event_sizes[ev.name] = size
+            except Exception as e:  # TensorBoard logs are optional: never stop training for them
+                print("[uploader] could not upload", ev.name, "-", repr(e)[:200], flush=True)
 
     def scan_once(self, final=False):
         self.upload_events()
@@ -88,8 +104,8 @@ class Uploader(threading.Thread):
                 t.add(ckdir, arcname=name)
             tar_remote = f"{RUN_TAG}/ckpt/seg{self.seg:03d}/{name}.tar"
             onnx_remote = f"{RUN_TAG}/onnx/seg{self.seg:03d}/{name}.onnx"
-            api.upload_file(path_or_fileobj=str(tar_local), path_in_repo=tar_remote, repo_id=HF_REPO)
-            api.upload_file(path_or_fileobj=str(onnx), path_in_repo=onnx_remote, repo_id=HF_REPO)
+            retry(api.upload_file, path_or_fileobj=str(tar_local), path_in_repo=tar_remote, repo_id=HF_REPO)
+            retry(api.upload_file, path_or_fileobj=str(onnx), path_in_repo=onnx_remote, repo_id=HF_REPO)
             self.m["checkpoints"].append({
                 "seg": self.seg, "name": name, "step": step, "cum": self.base + step,
                 "tar": tar_remote, "onnx": onnx_remote,
@@ -132,7 +148,10 @@ def main():
         shutil.rmtree(dest, ignore_errors=True)
         dest.mkdir(parents=True)
         with tarfile.open(tar_path) as t:
-            t.extractall(dest)
+            try:
+                t.extractall(dest, filter="data")
+            except TypeError:  # older Python without the filter argument
+                t.extractall(dest)
         cmd += ["--restore_checkpoint_path", str(dest / best["name"])]
 
     up = Uploader(outdir, seg, done, m)
@@ -141,7 +160,10 @@ def main():
     rc = subprocess.call(cmd)
     up.stop_ev.set()
     up.join(timeout=1)
-    up.scan_once(final=True)
+    try:
+        up.scan_once(final=True)
+    except Exception as e:
+        print("WARNING: final upload failed, some checkpoints may be missing on the Hub:", repr(e)[:300], flush=True)
     print("Runner exit code:", rc)
     return rc
 
